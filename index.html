@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>7セグ認識 Webアプリ v9（Tesseract補助: ssd_int.traineddata）</title>
+<title>7セグ認識 Webアプリ v10（Tesseract補助: ssd.traineddata）</title>
 <style>
   body{font-family:system-ui,-apple-system,sans-serif;margin:0;background:#111;color:#eee}
   .wrap{display:flex;flex-direction:column;gap:10px;padding:10px;max-width:1100px;margin:0 auto}
@@ -85,14 +85,14 @@
   </div>
 
   <details open>
-    <summary>精度UP（安定化 + ゲート + Tesseract補助）</summary>
+    <summary>安定化 + ゲート + Tesseract補助（SSD）</summary>
     <div class="row" style="margin-top:8px">
       <span class="chip"><input id="thrSmooth" type="checkbox" checked>使用Tを平滑化</span>
       <span class="chip"><input id="stabilize" type="checkbox" checked>ちらつき防止</span>
       <span class="chip"><input id="hold" type="checkbox" checked>確定値ホールド</span>
       <span class="chip"><input id="gateOn" type="checkbox" checked>誤認識ゲート</span>
       <span class="chip"><input id="force1dp" type="checkbox" checked>小数1桁に揃える</span>
-      <span class="chip"><input id="tessOn" type="checkbox" checked>Tesseract補助（SSD）</span>
+      <span class="chip"><input id="tessOn" type="checkbox" checked>Tesseract補助（ssd）</span>
     </div>
 
     <div class="kv"><label>T平滑化係数（0〜0.95）</label><input id="smoothA" type="range" min="0" max="0.95" step="0.05" value="0.75"><span id="smoothAval"></span></div>
@@ -113,8 +113,8 @@
     </div>
 
     <div class="hint warn" style="margin-top:8px">
-      Tesseract補助を使うには、同じフォルダに <span class="mono">tessdata/ssd_int.traineddata</span> を置き、
-      <b>https配信（GitHub Pages等）</b>で開いてください（iPhoneのfile://だと読み込みに失敗しがち）。
+      Tesseract補助を使うには、同じフォルダに <span class="mono">tessdata/ssd.traineddata</span> を置き、
+      <b>https配信（GitHub Pages等）</b>で開いてください（iPhoneのfile://直開きは失敗しがち）。
     </div>
   </details>
 
@@ -202,7 +202,7 @@ const LS={
   thrMode:"sevenseg_thrMode",
   off:"sevenseg_throff",
   seg:"sevenseg_segthr",
-  roi:"sevenseg_roi_v9",
+  roi:"sevenseg_roi_v10",
   thrSmooth:"sevenseg_thrsmooth",
   smoothA:"sevenseg_smootha",
   stab:"sevenseg_stab",
@@ -480,7 +480,7 @@ function boxMean(ii,w,h,x1,y1,x2,y2){
   return sum/Math.max(1,area);
 }
 
-// blob bbox (thin1 friendly)
+// blob bbox
 function bestSegmentBySum(arr,thr){
   let best={ok:false,a:0,b:0,sum:0};
   let a=-1,sum=0;
@@ -619,14 +619,14 @@ function recognizeDigits(bw,w,h,nDigits,decimalMode,segOnThr,blob){
   const debugBoxes=[];
   if(segs.length<nDigits) return recognizeByEqualSplit(bw,w,h,x0,y0,ww,hh,nDigits,decimalMode,segOnThr,debugBoxes);
   if(segs.length>nDigits){
-    segs.sort((s1,s2)=>(s2.b-s2.a)-(s1.b-s1.a));
+    segs.sort((s1,s2)=>(s2.b-s1.a)-(s1.b-s1.a));
     segs=segs.slice(0,nDigits);
     segs.sort((s1,s2)=>s1.a-s2.a);
   }
   const boxes=segs.map(s=>({blank:false,x:x0+s.a,y:y0,w:(s.b-s.a+1),h:hh}));
 
   const samples={a:[0.50,0.18],b:[0.82,0.35],c:[0.82,0.72],d:[0.50,0.88],e:[0.18,0.72],f:[0.18,0.35],g:[0.50,0.53]};
-  const map={"1111110":"0","0110000":"1","1101101":"2","1111001":"3","0110011":"4","1011011":"5","1011111":"6","1110010":"7","1111111":"8","1111011":"9","0000000":""};
+  const map={"1111110":"0","0110000":"1","1101101":"2","1111001":"3","0110011":"4","1011011":"5","1011111":"6","1110000":"7","1111111":"8","1111011":"9","0000000":""};
 
   let digits=[], confSum=0;
   for(const b of boxes){
@@ -746,25 +746,34 @@ let lastTessAt=0;
 
 function setTessState(msg){ tessStateEl.textContent = "tess: " + msg; }
 
+// ★ここが「ssd」モデル固定
+const TESS_LANG = "ssd";
+
 async function initTesseract(){
   if(tessReady) return true;
   if(!window.Tesseract){ setTessState("Tesseract.js not loaded"); return false; }
-  setTessState("initializing… (ssd_int)");
+  setTessState("initializing… ("+TESS_LANG+")");
   try{
+    // 重要：
+    // - langPath は traineddata を置いたフォルダ
+    // - gzip:false は ".traineddata" を探す（trueだと ".traineddata.gz" を探す）
     tessWorker = await Tesseract.createWorker({
       langPath: "./tessdata",
       gzip: false,
       logger: (m)=>{ /* console.log(m) */ }
     });
     await tessWorker.load();
-    await tessWorker.loadLanguage("ssd");
-    await tessWorker.initialize("ssd");
+    await tessWorker.loadLanguage(TESS_LANG);
+    await tessWorker.initialize(TESS_LANG);
+
+    // 数字+ドットだけに制限（誤認識減らす）
     await tessWorker.setParameters({
       tessedit_char_whitelist: "0123456789.",
-      tessedit_pageseg_mode: Tesseract.PSM.SINGLE_LINE
+      tessedit_pageseg_mode: Tesseract.PSM.SINGLE_WORD
     });
+
     tessReady=true;
-    setTessState("ready (ssd)");
+    setTessState("ready ("+TESS_LANG+")");
     return true;
   }catch(e){
     tessReady=false;
@@ -975,7 +984,7 @@ function loop(){
   dbgEl.textContent =
     `thr=${thrModeEl.value} inv=${invertEl.checked?1:0} dil=${dilateEl.checked?1:0} segThr=${segThr.toFixed(2)} | ` +
     `stable=${stabilizeEl.checked?1:0} consec=${consec}/${needFrames} conf=${conf.toFixed(2)} needConf=${needConf.toFixed(2)} grace=${graceMs}ms gate=${gateOnEl.checked?1:0} | ` +
-    `tess=${tessOnEl.checked?1:0} ready=${tessReady?1:0} busy=${tessBusy?1:0} | cam="${camLabel}"`;
+    `tess=${tessOnEl.checked?1:0} ready=${tessReady?1:0} busy=${tessBusy?1:0} lang=${TESS_LANG} | cam="${camLabel}"`;
 
   rafId=requestAnimationFrame(loop);
 }
