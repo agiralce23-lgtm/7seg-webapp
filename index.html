@@ -35,6 +35,11 @@
     <label>カメラ</label>
     <select id="selCam"></select>
 
+    <label style="display:flex;align-items:center;gap:6px;">
+      <input id="lockBack" type="checkbox" checked />
+      背面固定
+    </label>
+
     <label>2値化</label>
     <input id="thr" type="range" min="0" max="255" value="140" />
     <span id="thrVal">140</span>
@@ -56,7 +61,6 @@
     <div class="stage">
       <video id="video" playsinline muted></video>
       <canvas id="overlay"></canvas>
-      <!-- ROIは固定比率（必要なら後でUIで動かせる） -->
       <div id="roi" class="roi"></div>
     </div>
 
@@ -66,14 +70,12 @@
       <div class="hint" id="dbg"></div>
       <hr style="border:0;border-top:1px solid #333;margin:10px 0;">
       <div class="hint">
-        <div>・体重計/7セグは <b>固定</b> が一番安定します（角度と距離を固定）。</div>
+        <div>・iPhone Safariは「停止→再開」で前面に戻ることがあるので、<b>背面固定</b>で背面を選び直すようにしてあります。</div>
         <div>・「2値化」を調整して、背景が黒、数字が白に近くなるのが理想。</div>
-        <div>・うまく行かない時は ROI を数字部分だけに tighter にするのが最優先。</div>
       </div>
     </div>
   </div>
 
-  <!-- 解析用の隠しキャンバス -->
   <canvas id="work" style="display:none;"></canvas>
 </div>
 
@@ -87,6 +89,7 @@ const ctxW = work.getContext('2d', { willReadFrequently:true });
 const btnStart = document.getElementById('btnStart');
 const btnStop  = document.getElementById('btnStop');
 const selCam   = document.getElementById('selCam');
+const lockBack = document.getElementById('lockBack');
 const thr      = document.getElementById('thr');
 const thrVal   = document.getElementById('thrVal');
 const digitsEl = document.getElementById('digits');
@@ -98,14 +101,28 @@ const roiEl    = document.getElementById('roi');
 let stream = null;
 let rafId = null;
 
-// ROI（画面比率で固定）: 左右中央寄せ、縦は中央付近。必要ならここを調整
+// ROI（画面比率で固定）
 const ROI = { x: 0.18, y: 0.38, w: 0.64, h: 0.24 }; // 0..1
+
+// 選択カメラを保持（停止→再開で前面に戻る対策）
+const LS_KEY = "sevenseg_cam_deviceid";
+const LS_LOCK = "sevenseg_lockback";
+lockBack.checked = (localStorage.getItem(LS_LOCK) ?? "1") === "1";
+lockBack.addEventListener('change', ()=> localStorage.setItem(LS_LOCK, lockBack.checked ? "1":"0"));
 
 thr.addEventListener('input', () => thrVal.textContent = thr.value);
 
-async function listCams(){
+function isBackLabel(label){
+  if(!label) return false;
+  return /(back|rear|environment|背面|リア|後ろ)/i.test(label);
+}
+
+async function listCams({preserve=true, autoPickBack=true} = {}){
+  const prev = preserve ? selCam.value : "";
+  const saved = localStorage.getItem(LS_KEY) || "";
   const devices = await navigator.mediaDevices.enumerateDevices();
   const cams = devices.filter(d => d.kind === 'videoinput');
+
   selCam.innerHTML = '';
   cams.forEach((c, i) => {
     const opt = document.createElement('option');
@@ -113,7 +130,37 @@ async function listCams(){
     opt.textContent = c.label || `Camera ${i+1}`;
     selCam.appendChild(opt);
   });
+
+  // 1) 直前選択を優先
+  const hasPrev = [...selCam.options].some(o => o.value === prev);
+  if(hasPrev){
+    selCam.value = prev;
+    return;
+  }
+
+  // 2) 保存済みdeviceIdを優先
+  const hasSaved = [...selCam.options].some(o => o.value === saved);
+  if(hasSaved){
+    selCam.value = saved;
+    return;
+  }
+
+  // 3) 背面っぽいラベルを自動選択（権限許可後に効く）
+  if(autoPickBack && lockBack.checked){
+    const backOpt = [...selCam.options].find(o => isBackLabel(o.textContent));
+    if(backOpt){
+      selCam.value = backOpt.value;
+      return;
+    }
+  }
+
+  // 4) それでもダメなら先頭
+  if(selCam.options.length) selCam.selectedIndex = 0;
 }
+
+selCam.addEventListener('change', () => {
+  localStorage.setItem(LS_KEY, selCam.value || "");
+});
 
 function setRoiBox(){
   const stage = roiEl.parentElement;
@@ -123,85 +170,111 @@ function setRoiBox(){
   roiEl.style.width  = (ROI.w * r.width) + 'px';
   roiEl.style.height = (ROI.h * r.height) + 'px';
 }
-
 window.addEventListener('resize', setRoiBox);
 
-btnStart.onclick = async () => {
-  try{
-    await listCams();
-    const deviceId = selCam.value || undefined;
+async function startCamera(){
+  // permission前はラベル空のことがあるが、選択枠だけでも作る
+  await listCams({preserve:true, autoPickBack:false});
 
-    stream = await navigator.mediaDevices.getUserMedia({
+  // まずは「背面優先」で権限確定（ここでラベルが取れるようになる）
+  try{
+    const tmp = await navigator.mediaDevices.getUserMedia({
       video: {
-        deviceId: deviceId ? { exact: deviceId } : undefined,
-        facingMode: "environment",
+        facingMode: { ideal: lockBack.checked ? "environment" : "user" },
         width: { ideal: 1280 },
         height:{ ideal: 720 }
       },
       audio: false
     });
-
-    video.srcObject = stream;
-    await video.play();
-
-    btnStart.disabled = true;
-    btnStop.disabled = false;
-
-    // canvasサイズを動画に合わせる
-    overlay.width = video.videoWidth;
-    overlay.height = video.videoHeight;
-
-    setRoiBox();
-    loop();
+    tmp.getTracks().forEach(t => t.stop());
   }catch(e){
-    alert('カメラ開始失敗: ' + e.message);
+    // 失敗しても次でdeviceId固定を試す
   }
-};
 
-btnStop.onclick = () => {
+  // ラベルが取れる状態で列挙し、背面を選び直す
+  await listCams({preserve:true, autoPickBack:true});
+
+  const deviceId = selCam.value || undefined;
+
+  // deviceIdで固定取得（停止→再開でも同じdeviceIdを使う）
+  stream = await navigator.mediaDevices.getUserMedia({
+    video: {
+      deviceId: deviceId ? { exact: deviceId } : undefined,
+      // deviceIdが無い場合だけ facingMode を効かせる
+      facingMode: deviceId ? undefined : { ideal: lockBack.checked ? "environment" : "user" },
+      width: { ideal: 1280 },
+      height:{ ideal: 720 }
+    },
+    audio: false
+  });
+
+  video.srcObject = stream;
+  await video.play();
+
+  btnStart.disabled = true;
+  btnStop.disabled = false;
+
+  overlay.width = video.videoWidth;
+  overlay.height = video.videoHeight;
+
+  setRoiBox();
+  loop();
+}
+
+function stopCamera(){
   cancelAnimationFrame(rafId);
   rafId = null;
   if(stream){
     stream.getTracks().forEach(t => t.stop());
     stream = null;
   }
+  // iOS対策：srcObject解除
+  video.pause();
+  video.srcObject = null;
+
   btnStart.disabled = false;
   btnStop.disabled = true;
   outEl.textContent = '—';
   dbgEl.textContent = '';
+}
+
+btnStart.onclick = async () => {
+  try{
+    await startCamera();
+  }catch(e){
+    alert('カメラ開始失敗: ' + (e?.name ? `${e.name}: ${e.message}` : e.message));
+  }
 };
 
+btnStop.onclick = () => stopCamera();
+
 selCam.onchange = async () => {
+  localStorage.setItem(LS_KEY, selCam.value || "");
   if(!stream) return;
-  btnStop.onclick();
+  stopCamera();
   await new Promise(r => setTimeout(r, 200));
   btnStart.onclick();
 };
 
 function loop(){
-  // 描画
   ctxO.clearRect(0,0,overlay.width,overlay.height);
-  // ROI実座標
+
   const rx = Math.floor(ROI.x * overlay.width);
   const ry = Math.floor(ROI.y * overlay.height);
   const rw = Math.floor(ROI.w * overlay.width);
   const rh = Math.floor(ROI.h * overlay.height);
 
-  // ROI切り出し → work canvas
   work.width = rw; work.height = rh;
   ctxW.drawImage(video, rx, ry, rw, rh, 0, 0, rw, rh);
 
-  // 2値化
   const imageData = ctxW.getImageData(0,0,rw,rh);
   const data = imageData.data;
   const T = parseInt(thr.value, 10);
 
-  // グレースケール + 2値（白=1, 黒=0）
   const bw = new Uint8Array(rw*rh);
   for(let i=0, p=0; i<data.length; i+=4, p++){
     const r = data[i], g = data[i+1], b = data[i+2];
     const y = (r*0.299 + g*0.587 + b*0.114);
-    // 数字が明るい前提（暗い数字なら反転が必要）
     bw[p] = (y > T) ? 1 : 0;
     const v = bw[p] ? 255 : 0;
     data[i]=data[i+1]=data[i+2]=v;
@@ -209,12 +282,10 @@ function loop(){
   }
   ctxW.putImageData(imageData, 0, 0);
 
-  // デバッグ描画（overlayにROI枠）
   ctxO.strokeStyle = 'rgba(255,0,0,.95)';
   ctxO.lineWidth = 3;
   ctxO.strokeRect(rx+1, ry+1, rw-2, rh-2);
 
-  // 認識
   const nd = parseInt(digitsEl.value, 10);
   const decMode = decEl.value;
   const result = recognize7seg(bw, rw, rh, nd, decMode);
@@ -230,23 +301,13 @@ function loop(){
   rafId = requestAnimationFrame(loop);
 }
 
-/**
- * 7セグ認識（簡易版）
- * - ROIを桁数で等分
- * - 各桁のa..g位置をサンプリングしてON/OFF
- * - パターン一致で数字化
- */
 function recognize7seg(bw, w, h, nDigits, decimalMode){
-  // 余白を少し取る（枠の縁のノイズ避け）
   const padX = Math.floor(w*0.02);
   const padY = Math.floor(h*0.10);
   const x0 = padX, y0 = padY, ww = w - padX*2, hh = h - padY*2;
 
-  // 桁幅
   const digitW = ww / nDigits;
 
-  // 7セグのサンプル位置（各桁内の相対座標）
-  // a:上, b:右上, c:右下, d:下, e:左下, f:左上, g:中央
   const samples = {
     a:[0.50,0.18],
     b:[0.82,0.35],
@@ -257,10 +318,8 @@ function recognize7seg(bw, w, h, nDigits, decimalMode){
     g:[0.50,0.53]
   };
 
-  // セグ点灯判定のしきい値（サンプル周辺の白比率）
   const segOnThr = 0.55;
 
-  // パターン→数字（a b c d e f g）
   const map = {
     "1111110":"0",
     "0110000":"1",
@@ -281,7 +340,6 @@ function recognize7seg(bw, w, h, nDigits, decimalMode){
     const dx = Math.floor(x0 + di*digitW);
     const dw = Math.floor(digitW);
 
-    // 各セグのON/OFF
     let bits = '';
     let localConf = 0;
     const order = ['a','b','c','d','e','f','g'];
@@ -292,7 +350,6 @@ function recognize7seg(bw, w, h, nDigits, decimalMode){
       const {ratio} = sampleWhiteRatio(bw, w, h, sx, sy, Math.max(2, Math.floor(Math.min(dw,hh)*0.03)));
       const on = ratio >= segOnThr;
       bits += on ? '1':'0';
-      // confidenceは「しきい値からどれだけ離れてるか」
       localConf += Math.min(1, Math.abs(ratio - segOnThr) / 0.45);
     }
     localConf /= 7;
@@ -308,14 +365,14 @@ function recognize7seg(bw, w, h, nDigits, decimalMode){
     return { text:null, conf:0, debug:`unmatched: ${text}` };
   }
 
-  // 小数点（簡易）：最後の1桁前に挿入（xxxx -> xxx.x）
   if(decimalMode === 'last'){
     if(text.length >= 2){
       text = text.slice(0, text.length-1) + '.' + text.slice(text.length-1);
     }
   }
 
-  return { text, conf, debug:`thr=${thr.value} digits=${nDigits}` };
+  const selLabel = selCam.selectedOptions?.[0]?.textContent || "";
+  return { text, conf, debug:`thr=${thr.value} digits=${nDigits} cam="${selLabel}"` };
 }
 
 function sampleWhiteRatio(bw, w, h, cx, cy, r){
@@ -331,9 +388,9 @@ function sampleWhiteRatio(bw, w, h, cx, cy, r){
   return { ratio: total ? white/total : 0 };
 }
 
-// 初回：権限許可すると label が見えるので再リスト
-navigator.mediaDevices?.addEventListener?.('devicechange', listCams);
-listCams().catch(()=>{});
+navigator.mediaDevices?.addEventListener?.('devicechange', () => listCams({preserve:true, autoPickBack:true}));
+listCams({preserve:true, autoPickBack:true}).catch(()=>{});
+setRoiBox();
 </script>
 </body>
 </html>
