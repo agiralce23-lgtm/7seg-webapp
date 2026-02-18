@@ -626,7 +626,7 @@ function recognizeDigits(bw,w,h,nDigits,decimalMode,segOnThr,blob){
   const boxes=segs.map(s=>({blank:false,x:x0+s.a,y:y0,w:(s.b-s.a+1),h:hh}));
 
   const samples={a:[0.50,0.18],b:[0.82,0.35],c:[0.82,0.72],d:[0.50,0.88],e:[0.18,0.72],f:[0.18,0.35],g:[0.50,0.53]};
-  const map={"1111110":"0","0110000":"1","1101101":"2","1111001":"3","0110011":"4","1011011":"5","1011111":"6","1110000":"7","1111111":"8","1111011":"9","0000000":""};
+  const map={"1111110":"0","0110000":"1","1101101":"2","1111001":"3","0110011":"4","1011011":"5","1011111":"6","1110010":"7","1111111":"8","1111011":"9","0000000":""};
 
   let digits=[], confSum=0;
   for(const b of boxes){
@@ -757,14 +757,14 @@ async function initTesseract(){
       logger: (m)=>{ /* console.log(m) */ }
     });
     await tessWorker.load();
-    await tessWorker.loadLanguage("ssd_int");
-    await tessWorker.initialize("ssd_int");
+    await tessWorker.loadLanguage("ssd");
+    await tessWorker.initialize("ssd");
     await tessWorker.setParameters({
       tessedit_char_whitelist: "0123456789.",
       tessedit_pageseg_mode: Tesseract.PSM.SINGLE_LINE
     });
     tessReady=true;
-    setTessState("ready (ssd_int)");
+    setTessState("ready (ssd)");
     return true;
   }catch(e){
     tessReady=false;
