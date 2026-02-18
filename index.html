@@ -3,13 +3,14 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>7セグ認識 Webアプリ v4（iPhone向け安定化）</title>
+<title>7セグ認識 Webアプリ v5（自動しきい値 / iPhone向け）</title>
 <style>
   body { font-family: system-ui, -apple-system, sans-serif; margin: 0; background:#111; color:#eee; }
-  .wrap { display:flex; flex-direction:column; gap:10px; padding:10px; max-width:1050px; margin:0 auto; }
+  .wrap { display:flex; flex-direction:column; gap:10px; padding:10px; max-width:1100px; margin:0 auto; }
   .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
   button, select, input { font-size:16px; padding:8px 10px; }
   .stage { position:relative; width:100%; aspect-ratio: 16/9; background:#000; overflow:hidden; border-radius:10px; }
+  /* ★重要：containで「見た目」と「実際の切り出し」を一致させる */
   video, canvas { position:absolute; inset:0; width:100%; height:100%; object-fit:contain; }
   .roi {
     position:absolute;
@@ -20,16 +21,17 @@
   }
   .panel { background:#1b1b1b; padding:10px; border-radius:10px; }
   .k { color:#9ad; }
-  .big { font-size:28px; font-weight:700; letter-spacing: .5px; }
+  .big { font-size:30px; font-weight:800; letter-spacing: .5px; }
   .hint { color:#bbb; font-size:13px; line-height:1.45; }
   .grid { display:grid; grid-template-columns: 1.1fr 0.9fr; gap:10px; }
-  @media (max-width: 800px){ .grid { grid-template-columns: 1fr; } }
+  @media (max-width: 820px){ .grid { grid-template-columns: 1fr; } }
   .chip { display:flex; align-items:center; gap:6px; background:#222; padding:6px 8px; border-radius:999px; }
   details { background:#151515; border-radius:10px; padding:8px 10px; }
   details summary { cursor:pointer; }
-  .kv { display:grid; grid-template-columns: 90px 1fr 60px; gap:8px; align-items:center; margin-top:8px;}
+  .kv { display:grid; grid-template-columns: 110px 1fr 70px; gap:8px; align-items:center; margin-top:8px;}
   .kv label{ color:#bbb; font-size:13px;}
   .kv input[type=range]{ width:100%; }
+  .mono{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 </style>
 </head>
 <body>
@@ -43,11 +45,15 @@
 
     <span class="chip"><input id="lockBack" type="checkbox" checked />背面固定</span>
     <span class="chip"><input id="invert" type="checkbox" checked />反転（黒い数字用）</span>
-    <span class="chip"><input id="dilate" type="checkbox" checked />太らせる（細いセグ対策）</span>
+    <span class="chip"><input id="dilate" type="checkbox" />太らせる</span>
 
-    <label>2値化</label>
-    <input id="thr" type="range" min="0" max="255" value="110" />
-    <span id="thrVal">110</span>
+    <span class="chip"><input id="autoThr" type="checkbox" checked />自動2値化（Otsu）</span>
+    <label>オフセット</label>
+    <input id="thrOff" type="range" min="-80" max="80" value="0" />
+    <span id="thrOffVal">0</span>
+
+    <label>使用しきい値</label>
+    <span id="thrUsed" class="mono">—</span>
 
     <label>桁</label>
     <select id="digits">
@@ -77,7 +83,8 @@
       <button id="btnRoiReset" type="button">ROIリセット（この機種向け）</button>
     </div>
     <div class="hint" style="margin-top:6px;">
-      赤枠＝ROI、シアン枠＝検出された「数字の塊」、黄色枠＝推定した各桁領域。
+      赤枠＝ROI、シアン枠＝検出された「数字の塊」、黄色枠＝推定した各桁領域。<br>
+      ※いまは <b>自動2値化</b> が入っているので、2値化スライダー調整は基本不要です。
     </div>
   </details>
 
@@ -91,12 +98,12 @@
     <div class="panel">
       <div><span class="k">認識結果</span></div>
       <div id="out" class="big">—</div>
-      <div class="hint" id="dbg"></div>
+      <div class="hint mono" id="dbg"></div>
       <hr style="border:0;border-top:1px solid #333;margin:10px 0;">
       <div class="hint">
-        <div><b>黒い数字</b>なので基本は <b>反転ON</b> のままでOK。</div>
-        <div>読めない時はまず <b>2値化</b>（90〜160）→ 次に <b>セグ判定</b>（0.28〜0.42）。</div>
-        <div>ROIは「表示窓」だけを囲むほど安定します。</div>
+        <div>「2値化が難しい」対策として、ROI内の明暗から自動でしきい値を決めます（<b>Otsu</b>）。</div>
+        <div>うまくいかない時だけ <b>オフセット</b> を ±10〜±30 程度動かしてください。</div>
+        <div>桁が「1」を含むと細くて消えやすいので、桁分割は <b>等分フォールバック</b> を入れてあります。</div>
       </div>
     </div>
   </div>
@@ -119,8 +126,11 @@ const lockBack = document.getElementById('lockBack');
 const invertEl = document.getElementById('invert');
 const dilateEl = document.getElementById('dilate');
 
-const thr      = document.getElementById('thr');
-const thrVal   = document.getElementById('thrVal');
+const autoThrEl = document.getElementById('autoThr');
+const thrOffEl = document.getElementById('thrOff');
+const thrOffVal = document.getElementById('thrOffVal');
+const thrUsedEl = document.getElementById('thrUsed');
+
 const digitsEl = document.getElementById('digits');
 const decEl    = document.getElementById('decimal');
 const segThrEl = document.getElementById('segThr');
@@ -143,46 +153,44 @@ const btnRoiReset = document.getElementById('btnRoiReset');
 let stream = null;
 let rafId = null;
 
-// 永続化
+// ===== storage =====
 const LS = {
   cam: "sevenseg_cam_deviceid",
   lock: "sevenseg_lockback",
   inv: "sevenseg_invert",
   dil: "sevenseg_dilate",
-  thr: "sevenseg_thr",
   segthr: "sevenseg_segthr",
-  roi: "sevenseg_roi_v4",
+  auto: "sevenseg_autothr",
+  off: "sevenseg_throff",
+  roi: "sevenseg_roi_v5",
 };
 
 const defaultRoi = { x: 0.18, y: 0.44, w: 0.64, h: 0.18 }; // 表示窓寄り
 let ROI = loadROI();
 
-function clamp01(v){ return Math.max(0, Math.min(1, v)); }
+function clamp(v, a, b){ return Math.max(a, Math.min(b, v)); }
+function clamp01(v){ return clamp(v, 0, 1); }
 
 function loadROI(){
   try{
     const s = localStorage.getItem(LS.roi);
     if(!s) return {...defaultRoi};
     const o = JSON.parse(s);
-    return {
-      x: clamp01(+o.x), y: clamp01(+o.y),
-      w: clamp01(+o.w), h: clamp01(+o.h)
-    };
-  }catch(_){
-    return {...defaultRoi};
-  }
+    return { x: clamp01(+o.x), y: clamp01(+o.y), w: clamp01(+o.w), h: clamp01(+o.h) };
+  }catch(_){ return {...defaultRoi}; }
 }
 function saveROI(){ localStorage.setItem(LS.roi, JSON.stringify(ROI)); }
 
 lockBack.checked = (localStorage.getItem(LS.lock) ?? "1") === "1";
 invertEl.checked = (localStorage.getItem(LS.inv) ?? "1") === "1";
-dilateEl.checked = (localStorage.getItem(LS.dil) ?? "1") === "1";
-thr.value = (localStorage.getItem(LS.thr) ?? "110");
+dilateEl.checked = (localStorage.getItem(LS.dil) ?? "0") === "1";
 segThrEl.value = (localStorage.getItem(LS.segthr) ?? "0.34");
+autoThrEl.checked = (localStorage.getItem(LS.auto) ?? "1") === "1";
+thrOffEl.value = (localStorage.getItem(LS.off) ?? "0");
 
 function syncLabels(){
-  thrVal.textContent = thr.value;
   segThrVal.textContent = Number(segThrEl.value).toFixed(2);
+  thrOffVal.textContent = String(thrOffEl.value);
 
   roiX.value = ROI.x; roiY.value = ROI.y; roiW.value = ROI.w; roiH.value = ROI.h;
   roiXv.textContent = ROI.x.toFixed(2);
@@ -219,15 +227,16 @@ btnRoiReset.onclick = ()=>{
 lockBack.addEventListener('change', ()=> localStorage.setItem(LS.lock, lockBack.checked ? "1":"0"));
 invertEl.addEventListener('change', ()=> localStorage.setItem(LS.inv, invertEl.checked ? "1":"0"));
 dilateEl.addEventListener('change', ()=> localStorage.setItem(LS.dil, dilateEl.checked ? "1":"0"));
-thr.addEventListener('input', () => { localStorage.setItem(LS.thr, thr.value); syncLabels(); });
-segThrEl.addEventListener('input', () => { localStorage.setItem(LS.segthr, segThrEl.value); syncLabels(); });
+segThrEl.addEventListener('input', ()=> { localStorage.setItem(LS.segthr, segThrEl.value); syncLabels(); });
 
-// camera
+autoThrEl.addEventListener('change', ()=> localStorage.setItem(LS.auto, autoThrEl.checked ? "1":"0"));
+thrOffEl.addEventListener('input', ()=> { localStorage.setItem(LS.off, thrOffEl.value); syncLabels(); });
+
+// ===== camera selection =====
 function isBackLabel(label){
   if(!label) return false;
   return /(back|rear|environment|背面|リア|後ろ)/i.test(label);
 }
-
 async function listCams({preserve=true, autoPickBack=true} = {}){
   const prev = preserve ? selCam.value : "";
   const saved = localStorage.getItem(LS.cam) || "";
@@ -253,7 +262,7 @@ async function listCams({preserve=true, autoPickBack=true} = {}){
 }
 selCam.addEventListener('change', () => localStorage.setItem(LS.cam, selCam.value || ""));
 
-// roi ui
+// ===== ROI overlay =====
 function setRoiBox(){
   const stage = roiEl.parentElement;
   const r = stage.getBoundingClientRect();
@@ -264,9 +273,10 @@ function setRoiBox(){
 }
 window.addEventListener('resize', setRoiBox);
 
-// start/stop
+// ===== start/stop =====
 async function startCamera(){
   await listCams({preserve:true, autoPickBack:false});
+  // permission warm-up
   try{
     const tmp = await navigator.mediaDevices.getUserMedia({
       video: { facingMode: { ideal: lockBack.checked ? "environment" : "user" } },
@@ -300,7 +310,6 @@ async function startCamera(){
   setRoiBox();
   loop();
 }
-
 function stopCamera(){
   cancelAnimationFrame(rafId);
   rafId = null;
@@ -315,14 +324,13 @@ function stopCamera(){
   btnStop.disabled  = true;
   outEl.textContent = '—';
   dbgEl.textContent = '';
+  thrUsedEl.textContent = '—';
 }
-
 btnStart.onclick = async () => {
   try{ await startCamera(); }
   catch(e){ alert('カメラ開始失敗: ' + (e?.name ? `${e.name}: ${e.message}` : e.message)); }
 };
 btnStop.onclick = () => stopCamera();
-
 selCam.onchange = async () => {
   localStorage.setItem(LS.cam, selCam.value || "");
   if(!stream) return;
@@ -331,78 +339,7 @@ selCam.onchange = async () => {
   btnStart.onclick();
 };
 
-// analysis loop
-function loop(){
-  ctxO.clearRect(0,0,overlay.width,overlay.height);
-
-  const rx = Math.floor(ROI.x * overlay.width);
-  const ry = Math.floor(ROI.y * overlay.height);
-  const rw = Math.floor(ROI.w * overlay.width);
-  const rh = Math.floor(ROI.h * overlay.height);
-
-  work.width = rw; work.height = rh;
-  ctxW.drawImage(video, rx, ry, rw, rh, 0, 0, rw, rh);
-
-  const imageData = ctxW.getImageData(0,0,rw,rh);
-  const data = imageData.data;
-  const T = parseInt(thr.value, 10);
-  const inv = invertEl.checked;
-
-  let bw = new Uint8Array(rw*rh);
-  for(let i=0, p=0; i<data.length; i+=4, p++){
-    const r = data[i], g = data[i+1], b = data[i+2];
-    const y = (r*0.299 + g*0.587 + b*0.114);
-    const on = inv ? (y < T) : (y > T);
-    bw[p] = on ? 1 : 0;
-    const v = on ? 255 : 0;
-    data[i]=data[i+1]=data[i+2]=v; data[i+3]=255;
-  }
-  ctxW.putImageData(imageData, 0, 0);
-
-  if(dilateEl.checked){
-    bw = dilate3x3(bw, rw, rh);
-  }
-
-  // ROI (red)
-  ctxO.strokeStyle = 'rgba(255,0,0,.95)';
-  ctxO.lineWidth = 3;
-  ctxO.strokeRect(rx+1, ry+1, rw-2, rh-2);
-
-  // blob bbox (cyan)
-  const blob = findDenseBlobBBox(bw, rw, rh);
-  if(blob.ok){
-    ctxO.strokeStyle = 'rgba(0,200,255,.95)';
-    ctxO.lineWidth = 3;
-    ctxO.strokeRect(rx + blob.x + 1, ry + blob.y + 1, blob.w - 2, blob.h - 2);
-  }
-
-  const nd = parseInt(digitsEl.value, 10);
-  const decMode = decEl.value;
-  const segThr = parseFloat(segThrEl.value);
-
-  const result = recognizeDigits(bw, rw, rh, nd, decMode, segThr, blob);
-
-  // digit boxes (yellow)
-  if(result.debugBoxes){
-    ctxO.strokeStyle = 'rgba(255,230,0,.95)';
-    ctxO.lineWidth = 2;
-    for(const b of result.debugBoxes){
-      ctxO.strokeRect(rx + b.x, ry + b.y, b.w, b.h);
-    }
-  }
-
-  if(result.text){
-    outEl.textContent = result.text;
-    dbgEl.textContent = result.debug;
-  }else{
-    outEl.textContent = '—';
-    dbgEl.textContent = result.debug;
-  }
-
-  rafId = requestAnimationFrame(loop);
-}
-
-// helpers
+// ===== image ops =====
 function dilate3x3(src, w, h){
   const dst = new Uint8Array(w*h);
   for(let y=0; y<h; y++){
@@ -420,6 +357,42 @@ function dilate3x3(src, w, h){
   return dst;
 }
 
+function otsuThresholdFromGray(gray){
+  // gray: Uint8Array
+  const hist = new Uint32Array(256);
+  for(let i=0;i<gray.length;i++) hist[gray[i]]++;
+  const total = gray.length;
+  if(total === 0) return 128;
+
+  let sum = 0;
+  for(let t=0;t<256;t++) sum += t * hist[t];
+
+  let sumB = 0;
+  let wB = 0;
+  let varMax = -1;
+  let threshold = 128;
+
+  for(let t=0;t<256;t++){
+    wB += hist[t];
+    if(wB === 0) continue;
+    const wF = total - wB;
+    if(wF === 0) break;
+
+    sumB += t * hist[t];
+
+    const mB = sumB / wB;
+    const mF = (sum - sumB) / wF;
+
+    const varBetween = wB * wF * (mB - mF) * (mB - mF);
+    if(varBetween > varMax){
+      varMax = varBetween;
+      threshold = t;
+    }
+  }
+  return threshold;
+}
+
+// ===== blob bbox from bw =====
 function bestSegmentBySum(arr, thr){
   let best = {ok:false, a:0,b:0,sum:0};
   let a=-1, sum=0;
@@ -481,6 +454,7 @@ function findDenseBlobBBox(bw, w, h){
   return {ok:true, x:x1, y:y1, w:ww, h:hh};
 }
 
+// ===== 7seg sampling =====
 function sampleWhiteRatio(bw,w,h,cx,cy,r){
   let white=0,total=0;
   const x1=Math.max(0,cx-r), x2=Math.min(w-1,cx+r);
@@ -526,6 +500,52 @@ function detectDotBetween(bw, w, h, boxes){
   return null;
 }
 
+function recognizeByEqualSplit(bw,w,h,x0,y0,ww,hh,nDigits,decimalMode,segOnThr,debugBoxes){
+  const digitW = ww / nDigits;
+  const samples = { a:[0.50,0.18], b:[0.82,0.35], c:[0.82,0.72], d:[0.50,0.88], e:[0.18,0.72], f:[0.18,0.35], g:[0.50,0.53] };
+  const map = {"1111110":"0","0110000":"1","1101101":"2","1111001":"3","0110011":"4","1011011":"5","1011111":"6","1110000":"7","1111111":"8","1111011":"9","0000000":""};
+  let digits=[]; let confSum=0;
+  for(let i=0;i<nDigits;i++){
+    const dx = Math.floor(x0 + i*digitW);
+    const dw = Math.max(3, Math.floor(digitW));
+    const rad = Math.max(1, Math.floor(Math.min(dw,hh)*0.018));
+    debugBoxes.push({x:dx,y:y0,w:dw,h:hh});
+    let bits=""; let local=0;
+    for(const k of ["a","b","c","d","e","f","g"]){
+      const [rx,ry]=samples[k];
+      const sx=Math.floor(dx + rx*dw);
+      const sy=Math.floor(y0 + ry*hh);
+      const ratio=sampleWhiteRatio(bw,w,h,sx,sy,rad);
+      const on = ratio >= segOnThr;
+      bits += on ? "1":"0";
+      local += Math.min(1, Math.abs(ratio - segOnThr) / Math.max(0.18, (1-segOnThr)));
+    }
+    local/=7;
+    digits.push(map[bits] ?? "?");
+    confSum += local;
+  }
+
+  // cleanup
+  if(digits.some(d=>d==="?")) digits = digits.map(d=> d==="?" ? "" : d);
+
+  let s = digits.join("");
+  if(decimalMode==="last"){
+    if(s.length>=2) s = s.slice(0,-1) + "." + s.slice(-1);
+  }else if(decimalMode==="auto"){
+    const dotIdx = detectDotBetween(bw, w, h, debugBoxes.map(b=>({blank:false,...b})));
+    if(dotIdx !== null){
+      const raw = digits.join("");
+      s = raw.slice(0, dotIdx) + "." + raw.slice(dotIdx);
+      s = s.replace(/^\./,"");
+    }else{
+      if(s.length>=2) s = s.slice(0,-1) + "." + s.slice(-1);
+    }
+  }
+
+  if(!/^[0-9]+(\.[0-9]+)?$/.test(s)) return {text:null, debug:`unmatched(eq): ${digits.join("")}`, debugBoxes};
+  return {text:s, debug:`eqSplit conf=${(confSum/nDigits).toFixed(2)}`, debugBoxes};
+}
+
 function recognizeDigits(bw, w, h, nDigits, decimalMode, segOnThr, blob){
   const bx = blob?.ok ? blob.x : 0;
   const by = blob?.ok ? blob.y : 0;
@@ -549,7 +569,9 @@ function recognizeDigits(bw, w, h, nDigits, decimalMode, segOnThr, blob){
   }
   let colMax=0;
   for(const v of col) if(v>colMax) colMax=v;
-  const cutThr = Math.max(3, Math.floor(colMax*0.18));
+
+  // ★薄い「1」を拾うため cutThr を少し下げる
+  const cutThr = Math.max(2, Math.floor(colMax*0.12));
 
   let segs=[];
   let a=-1;
@@ -560,11 +582,15 @@ function recognizeDigits(bw, w, h, nDigits, decimalMode, segOnThr, blob){
   }
   if(a>=0) segs.push({a, b:ww-1});
 
-  const minW = Math.max(2, Math.floor(ww*0.03));
+  // ★細い桁(1)を落としにくいよう minW を小さめに
+  const minW = Math.max(1, Math.floor(ww*0.012)); // 1.2%
   segs = segs.filter(s => (s.b-s.a+1) >= minW);
 
-  if(segs.length === 0){
-    return {text:null, debug:`no segments (thr=${thr.value})`, debugBoxes:[]};
+  const debugBoxes = [];
+
+  // ★桁が足りない時は「空白埋め」ではなく等分にフォールバック（ここが 4.5 問題の根治）
+  if(segs.length < nDigits){
+    return recognizeByEqualSplit(bw, w, h, x0, y0, ww, hh, nDigits, decimalMode, segOnThr, debugBoxes);
   }
 
   if(segs.length > nDigits){
@@ -573,14 +599,7 @@ function recognizeDigits(bw, w, h, nDigits, decimalMode, segOnThr, blob){
     segs.sort((s1,s2)=> s1.a - s2.a);
   }
 
-  const blanks = nDigits - segs.length;
-  const boxes=[];
-  for(let i=0;i<blanks;i++) boxes.push({blank:true, x:0,y:0,w:0,h:0});
-  for(const s of segs){
-    const dx = x0 + s.a;
-    const dw = (s.b - s.a + 1);
-    boxes.push({blank:false, x:dx, y:y0, w:dw, h:hh});
-  }
+  const boxes = segs.map(s => ({blank:false, x:x0+s.a, y:y0, w:(s.b-s.a+1), h:hh}));
 
   const samples = {
     a:[0.50,0.18], b:[0.82,0.35], c:[0.82,0.72],
@@ -593,11 +612,8 @@ function recognizeDigits(bw, w, h, nDigits, decimalMode, segOnThr, blob){
   };
 
   let digits=[]; let confSum=0;
-  const debugBoxes=[];
   for(const b of boxes){
-    if(b.blank){ digits.push(""); continue; }
     debugBoxes.push({x:b.x, y:b.y, w:b.w, h:b.h});
-
     const dw = Math.max(3, b.w);
     const dh = Math.max(3, b.h);
     const rad = Math.max(1, Math.floor(Math.min(dw,dh)*0.018));
@@ -615,22 +631,11 @@ function recognizeDigits(bw, w, h, nDigits, decimalMode, segOnThr, blob){
     local/=7;
 
     const d = (map[bits] !== undefined) ? map[bits] : "?";
-    digits.push(d);
+    digits.push(d==="?"? "" : d);
     confSum += local;
   }
 
-  if(digits.every(d=>d==="")){
-    return {text:null, debug:`all blank (thr=${thr.value})`, debugBoxes};
-  }
-
-  // small cleanup
-  if(digits.some(d=>d==="?")){
-    // try: treat ? as blank (usually leading empty)
-    digits = digits.map(d=> d==="?" ? "" : d);
-  }
-
   let s = digits.join("");
-  s = s.replace(/^\s+/, "");
 
   if(decimalMode === "last"){
     if(s.length>=2) s = s.slice(0,-1) + "." + s.slice(-1);
@@ -646,19 +651,102 @@ function recognizeDigits(bw, w, h, nDigits, decimalMode, segOnThr, blob){
   }
 
   if(!/^[0-9]+(\.[0-9]+)?$/.test(s)){
-    return {text:null, debug:`unmatched: ${digits.join("")} (thr=${thr.value} segThr=${segOnThr.toFixed(2)})`, debugBoxes};
+    return {text:null, debug:`unmatched: ${digits.join("")}`, debugBoxes};
+  }
+
+  const conf = confSum / Math.max(1, boxes.length);
+  return {text:s, debug:`conf=${conf.toFixed(2)} segThr=${segOnThr.toFixed(2)}`, debugBoxes};
+}
+
+// ===== main loop =====
+function loop(){
+  ctxO.clearRect(0,0,overlay.width,overlay.height);
+
+  const rx = Math.floor(ROI.x * overlay.width);
+  const ry = Math.floor(ROI.y * overlay.height);
+  const rw = Math.floor(ROI.w * overlay.width);
+  const rh = Math.floor(ROI.h * overlay.height);
+
+  work.width = rw; work.height = rh;
+  ctxW.drawImage(video, rx, ry, rw, rh, 0, 0, rw, rh);
+
+  const imageData = ctxW.getImageData(0,0,rw,rh);
+  const data = imageData.data;
+
+  // gray buffer
+  const gray = new Uint8Array(rw*rh);
+  for(let i=0, p=0; i<data.length; i+=4, p++){
+    const r=data[i], g=data[i+1], b=data[i+2];
+    gray[p] = (r*0.299 + g*0.587 + b*0.114) | 0;
+  }
+
+  let T;
+  if(autoThrEl.checked){
+    T = otsuThresholdFromGray(gray);
+  }else{
+    // 手動にしたい時は、オフセットを0にしてもOK
+    T = 110;
+  }
+  T = clamp(T + parseInt(thrOffEl.value,10), 0, 255);
+  thrUsedEl.textContent = String(T);
+
+  const inv = invertEl.checked;
+
+  let bw = new Uint8Array(rw*rh);
+  for(let p=0; p<gray.length; p++){
+    const on = inv ? (gray[p] < T) : (gray[p] > T);
+    bw[p] = on ? 1 : 0;
+  }
+
+  if(dilateEl.checked){
+    bw = dilate3x3(bw, rw, rh);
+  }
+
+  // ROI枠（赤）
+  ctxO.strokeStyle = 'rgba(255,0,0,.95)';
+  ctxO.lineWidth = 3;
+  ctxO.strokeRect(rx+1, ry+1, rw-2, rh-2);
+
+  // blob bbox（シアン）
+  const blob = findDenseBlobBBox(bw, rw, rh);
+  if(blob.ok){
+    ctxO.strokeStyle = 'rgba(0,200,255,.95)';
+    ctxO.lineWidth = 3;
+    ctxO.strokeRect(rx + blob.x + 1, ry + blob.y + 1, blob.w - 2, blob.h - 2);
+  }
+
+  const nd = parseInt(digitsEl.value, 10);
+  const decMode = decEl.value;
+  const segThr = parseFloat(segThrEl.value);
+
+  const res = recognizeDigits(bw, rw, rh, nd, decMode, segThr, blob);
+
+  // digit boxes（黄）
+  if(res.debugBoxes && res.debugBoxes.length){
+    ctxO.strokeStyle = 'rgba(255,230,0,.95)';
+    ctxO.lineWidth = 2;
+    for(const b of res.debugBoxes){
+      ctxO.strokeRect(rx + b.x, ry + b.y, b.w, b.h);
+    }
   }
 
   const camLabel = selCam.selectedOptions?.[0]?.textContent || "";
-  const realCount = boxes.filter(b=>!b.blank).length || 1;
-  const conf = confSum/realCount;
-  return {text:s, debug:`conf=${conf.toFixed(2)} thr=${thr.value} inv=${invertEl.checked?1:0} dil=${dilateEl.checked?1:0} segThr=${segOnThr.toFixed(2)} cam="${camLabel}"`, debugBoxes};
+  if(res.text){
+    outEl.textContent = res.text;
+    dbgEl.textContent = `${res.debug} | T=${T} inv=${inv?1:0} dil=${dilateEl.checked?1:0} cam="${camLabel}"`;
+  }else{
+    outEl.textContent = '—';
+    dbgEl.textContent = `${res.debug || "no match"} | T=${T} inv=${inv?1:0} dil=${dilateEl.checked?1:0} cam="${camLabel}"`;
+  }
+
+  rafId = requestAnimationFrame(loop);
 }
 
 // init
 navigator.mediaDevices?.addEventListener?.('devicechange', () => listCams({preserve:true, autoPickBack:true}));
 listCams({preserve:true, autoPickBack:true}).catch(()=>{});
 setRoiBox();
+syncLabels();
 </script>
 </body>
 </html>
