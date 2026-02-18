@@ -1,0 +1,339 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>7セグ認識 Webアプリ（ROI固定）</title>
+<style>
+  body { font-family: system-ui, -apple-system, sans-serif; margin: 0; background:#111; color:#eee; }
+  .wrap { display:flex; flex-direction:column; gap:10px; padding:10px; max-width:980px; margin:0 auto; }
+  .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+  button, select, input { font-size:16px; padding:8px 10px; }
+  .stage { position:relative; width:100%; aspect-ratio: 16/9; background:#000; overflow:hidden; border-radius:10px; }
+  video, canvas { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; }
+  .roi {
+    position:absolute;
+    border:2px solid rgba(255,0,0,.9);
+    box-shadow: 0 0 0 9999px rgba(0,0,0,.35);
+    border-radius:6px;
+    pointer-events:none;
+  }
+  .panel { background:#1b1b1b; padding:10px; border-radius:10px; }
+  .k { color:#9ad; }
+  .big { font-size:28px; font-weight:700; letter-spacing: .5px; }
+  .hint { color:#bbb; font-size:13px; line-height:1.4; }
+  .grid { display:grid; grid-template-columns: 1fr 1fr; gap:10px; }
+  @media (max-width: 700px){ .grid { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="row">
+    <button id="btnStart">カメラ開始</button>
+    <button id="btnStop" disabled>停止</button>
+
+    <label>カメラ</label>
+    <select id="selCam"></select>
+
+    <label>2値化</label>
+    <input id="thr" type="range" min="0" max="255" value="140" />
+    <span id="thrVal">140</span>
+
+    <label>桁</label>
+    <select id="digits">
+      <option value="4" selected>4桁</option>
+      <option value="5">5桁</option>
+    </select>
+
+    <label>小数点</label>
+    <select id="decimal">
+      <option value="none">なし</option>
+      <option value="last" selected>最後の1桁前（xxx.x）</option>
+    </select>
+  </div>
+
+  <div class="grid">
+    <div class="stage">
+      <video id="video" playsinline muted></video>
+      <canvas id="overlay"></canvas>
+      <!-- ROIは固定比率（必要なら後でUIで動かせる） -->
+      <div id="roi" class="roi"></div>
+    </div>
+
+    <div class="panel">
+      <div><span class="k">認識結果</span></div>
+      <div id="out" class="big">—</div>
+      <div class="hint" id="dbg"></div>
+      <hr style="border:0;border-top:1px solid #333;margin:10px 0;">
+      <div class="hint">
+        <div>・体重計/7セグは <b>固定</b> が一番安定します（角度と距離を固定）。</div>
+        <div>・「2値化」を調整して、背景が黒、数字が白に近くなるのが理想。</div>
+        <div>・うまく行かない時は ROI を数字部分だけに tighter にするのが最優先。</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 解析用の隠しキャンバス -->
+  <canvas id="work" style="display:none;"></canvas>
+</div>
+
+<script>
+const video = document.getElementById('video');
+const overlay = document.getElementById('overlay');
+const work = document.getElementById('work');
+const ctxO = overlay.getContext('2d', { willReadFrequently:true });
+const ctxW = work.getContext('2d', { willReadFrequently:true });
+
+const btnStart = document.getElementById('btnStart');
+const btnStop  = document.getElementById('btnStop');
+const selCam   = document.getElementById('selCam');
+const thr      = document.getElementById('thr');
+const thrVal   = document.getElementById('thrVal');
+const digitsEl = document.getElementById('digits');
+const decEl    = document.getElementById('decimal');
+const outEl    = document.getElementById('out');
+const dbgEl    = document.getElementById('dbg');
+const roiEl    = document.getElementById('roi');
+
+let stream = null;
+let rafId = null;
+
+// ROI（画面比率で固定）: 左右中央寄せ、縦は中央付近。必要ならここを調整
+const ROI = { x: 0.18, y: 0.38, w: 0.64, h: 0.24 }; // 0..1
+
+thr.addEventListener('input', () => thrVal.textContent = thr.value);
+
+async function listCams(){
+  const devices = await navigator.mediaDevices.enumerateDevices();
+  const cams = devices.filter(d => d.kind === 'videoinput');
+  selCam.innerHTML = '';
+  cams.forEach((c, i) => {
+    const opt = document.createElement('option');
+    opt.value = c.deviceId;
+    opt.textContent = c.label || `Camera ${i+1}`;
+    selCam.appendChild(opt);
+  });
+}
+
+function setRoiBox(){
+  const stage = roiEl.parentElement;
+  const r = stage.getBoundingClientRect();
+  roiEl.style.left = (ROI.x * r.width) + 'px';
+  roiEl.style.top  = (ROI.y * r.height) + 'px';
+  roiEl.style.width  = (ROI.w * r.width) + 'px';
+  roiEl.style.height = (ROI.h * r.height) + 'px';
+}
+
+window.addEventListener('resize', setRoiBox);
+
+btnStart.onclick = async () => {
+  try{
+    await listCams();
+    const deviceId = selCam.value || undefined;
+
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: {
+        deviceId: deviceId ? { exact: deviceId } : undefined,
+        facingMode: "environment",
+        width: { ideal: 1280 },
+        height:{ ideal: 720 }
+      },
+      audio: false
+    });
+
+    video.srcObject = stream;
+    await video.play();
+
+    btnStart.disabled = true;
+    btnStop.disabled = false;
+
+    // canvasサイズを動画に合わせる
+    overlay.width = video.videoWidth;
+    overlay.height = video.videoHeight;
+
+    setRoiBox();
+    loop();
+  }catch(e){
+    alert('カメラ開始失敗: ' + e.message);
+  }
+};
+
+btnStop.onclick = () => {
+  cancelAnimationFrame(rafId);
+  rafId = null;
+  if(stream){
+    stream.getTracks().forEach(t => t.stop());
+    stream = null;
+  }
+  btnStart.disabled = false;
+  btnStop.disabled = true;
+  outEl.textContent = '—';
+  dbgEl.textContent = '';
+};
+
+selCam.onchange = async () => {
+  if(!stream) return;
+  btnStop.onclick();
+  await new Promise(r => setTimeout(r, 200));
+  btnStart.onclick();
+};
+
+function loop(){
+  // 描画
+  ctxO.clearRect(0,0,overlay.width,overlay.height);
+  // ROI実座標
+  const rx = Math.floor(ROI.x * overlay.width);
+  const ry = Math.floor(ROI.y * overlay.height);
+  const rw = Math.floor(ROI.w * overlay.width);
+  const rh = Math.floor(ROI.h * overlay.height);
+
+  // ROI切り出し → work canvas
+  work.width = rw; work.height = rh;
+  ctxW.drawImage(video, rx, ry, rw, rh, 0, 0, rw, rh);
+
+  // 2値化
+  const imageData = ctxW.getImageData(0,0,rw,rh);
+  const data = imageData.data;
+  const T = parseInt(thr.value, 10);
+
+  // グレースケール + 2値（白=1, 黒=0）
+  const bw = new Uint8Array(rw*rh);
+  for(let i=0, p=0; i<data.length; i+=4, p++){
+    const r = data[i], g = data[i+1], b = data[i+2];
+    const y = (r*0.299 + g*0.587 + b*0.114);
+    // 数字が明るい前提（暗い数字なら反転が必要）
+    bw[p] = (y > T) ? 1 : 0;
+    const v = bw[p] ? 255 : 0;
+    data[i]=data[i+1]=data[i+2]=v;
+    data[i+3]=255;
+  }
+  ctxW.putImageData(imageData, 0, 0);
+
+  // デバッグ描画（overlayにROI枠）
+  ctxO.strokeStyle = 'rgba(255,0,0,.95)';
+  ctxO.lineWidth = 3;
+  ctxO.strokeRect(rx+1, ry+1, rw-2, rh-2);
+
+  // 認識
+  const nd = parseInt(digitsEl.value, 10);
+  const decMode = decEl.value;
+  const result = recognize7seg(bw, rw, rh, nd, decMode);
+
+  if(result.text){
+    outEl.textContent = result.text;
+    dbgEl.textContent = `confidence=${result.conf.toFixed(2)} | ${result.debug}`;
+  }else{
+    outEl.textContent = '—';
+    dbgEl.textContent = result.debug || '';
+  }
+
+  rafId = requestAnimationFrame(loop);
+}
+
+/**
+ * 7セグ認識（簡易版）
+ * - ROIを桁数で等分
+ * - 各桁のa..g位置をサンプリングしてON/OFF
+ * - パターン一致で数字化
+ */
+function recognize7seg(bw, w, h, nDigits, decimalMode){
+  // 余白を少し取る（枠の縁のノイズ避け）
+  const padX = Math.floor(w*0.02);
+  const padY = Math.floor(h*0.10);
+  const x0 = padX, y0 = padY, ww = w - padX*2, hh = h - padY*2;
+
+  // 桁幅
+  const digitW = ww / nDigits;
+
+  // 7セグのサンプル位置（各桁内の相対座標）
+  // a:上, b:右上, c:右下, d:下, e:左下, f:左上, g:中央
+  const samples = {
+    a:[0.50,0.18],
+    b:[0.82,0.35],
+    c:[0.82,0.72],
+    d:[0.50,0.88],
+    e:[0.18,0.72],
+    f:[0.18,0.35],
+    g:[0.50,0.53]
+  };
+
+  // セグ点灯判定のしきい値（サンプル周辺の白比率）
+  const segOnThr = 0.55;
+
+  // パターン→数字（a b c d e f g）
+  const map = {
+    "1111110":"0",
+    "0110000":"1",
+    "1101101":"2",
+    "1111001":"3",
+    "0110011":"4",
+    "1011011":"5",
+    "1011111":"6",
+    "1110000":"7",
+    "1111111":"8",
+    "1111011":"9"
+  };
+
+  let text = '';
+  let confSum = 0;
+
+  for(let di=0; di<nDigits; di++){
+    const dx = Math.floor(x0 + di*digitW);
+    const dw = Math.floor(digitW);
+
+    // 各セグのON/OFF
+    let bits = '';
+    let localConf = 0;
+    const order = ['a','b','c','d','e','f','g'];
+    for(const k of order){
+      const [rx, ry] = samples[k];
+      const sx = Math.floor(dx + rx*dw);
+      const sy = Math.floor(y0 + ry*hh);
+      const {ratio} = sampleWhiteRatio(bw, w, h, sx, sy, Math.max(2, Math.floor(Math.min(dw,hh)*0.03)));
+      const on = ratio >= segOnThr;
+      bits += on ? '1':'0';
+      // confidenceは「しきい値からどれだけ離れてるか」
+      localConf += Math.min(1, Math.abs(ratio - segOnThr) / 0.45);
+    }
+    localConf /= 7;
+
+    const digit = map[bits] ?? '?';
+    text += digit;
+    confSum += localConf;
+  }
+
+  let conf = confSum / nDigits;
+
+  if(text.includes('?')) {
+    return { text:null, conf:0, debug:`unmatched: ${text}` };
+  }
+
+  // 小数点（簡易）：最後の1桁前に挿入（xxxx -> xxx.x）
+  if(decimalMode === 'last'){
+    if(text.length >= 2){
+      text = text.slice(0, text.length-1) + '.' + text.slice(text.length-1);
+    }
+  }
+
+  return { text, conf, debug:`thr=${thr.value} digits=${nDigits}` };
+}
+
+function sampleWhiteRatio(bw, w, h, cx, cy, r){
+  let white = 0, total = 0;
+  const x1 = Math.max(0, cx-r), x2 = Math.min(w-1, cx+r);
+  const y1 = Math.max(0, cy-r), y2 = Math.min(h-1, cy+r);
+  for(let y=y1; y<=y2; y++){
+    for(let x=x1; x<=x2; x++){
+      total++;
+      if(bw[y*w + x]) white++;
+    }
+  }
+  return { ratio: total ? white/total : 0 };
+}
+
+// 初回：権限許可すると label が見えるので再リスト
+navigator.mediaDevices?.addEventListener?.('devicechange', listCams);
+listCams().catch(()=>{});
+</script>
+</body>
+</html>
